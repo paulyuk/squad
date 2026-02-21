@@ -67,6 +67,9 @@ if (cmd === '--help' || cmd === '-h' || cmd === 'help') {
   console.log(`  ${BOLD}watch${RESET}      Run Ralph's work monitor as a local polling process`);
   console.log(`             Usage: watch [--interval <minutes>]`);
   console.log(`             Default: checks every 10 minutes (Ctrl+C to stop)`);
+  console.log(`  ${BOLD}observe${RESET}    Watch agent activity in real-time (experimental)`);
+  console.log(`             Usage: observe [--endpoint <url>] [--verbose]`);
+  console.log(`             Streams agent output to console and optionally to Aspire Dashboard`);
   console.log(`  ${BOLD}plugin${RESET}     Manage plugin marketplaces`);
   console.log(`             Usage: plugin marketplace add|remove|list|browse`);
   console.log(`  ${BOLD}export${RESET}     Export squad to a portable JSON snapshot`);
@@ -99,6 +102,93 @@ function copyRecursive(src, target) {
   }
 }
 
+
+// --- Observe subcommand (agent activity monitor) ---
+if (cmd === 'observe') {
+  const squadDirInfo = detectSquadDir(dest);
+  if (squadDirInfo.isLegacy) showDeprecationWarning();
+  
+  if (!fs.existsSync(squadDirInfo.path)) {
+    fatal('No squad found — run init first.');
+  }
+
+  // Parse flags
+  const args = process.argv.slice(3);
+  const endpointIdx = args.indexOf('--endpoint');
+  const endpoint = (endpointIdx !== -1 && args[endpointIdx + 1])
+    ? args[endpointIdx + 1]
+    : process.env.OTEL_EXPORTER_OTLP_ENDPOINT || null;
+  const verbose = args.includes('--verbose') || args.includes('-v');
+
+  console.log(`
+${BOLD}╔═══════════════════════════════════════════════════════════╗
+║               🔭 Squad Observer v${pkg.version.padEnd(22)}║
+║          Real-time agent observability dashboard          ║
+╚═══════════════════════════════════════════════════════════╝${RESET}
+`);
+  console.log(`📁 Watching: ${squadDirInfo.path}`);
+  if (endpoint) {
+    console.log(`📡 Telemetry: ${endpoint}`);
+  } else {
+    console.log(`📡 Telemetry: ${DIM}disabled (use --endpoint <url> for Aspire)${RESET}`);
+  }
+  console.log('');
+
+  // Try to load the observer package
+  const observerPath = path.join(root, 'packages', 'squad-observer');
+  if (!fs.existsSync(observerPath)) {
+    fatal('squad-observer package not found. Run: cd packages/squad-observer && npm install');
+  }
+
+  // Check if node_modules exists
+  if (!fs.existsSync(path.join(observerPath, 'node_modules'))) {
+    console.log(`${YELLOW}Installing observer dependencies...${RESET}`);
+    const { execSync } = require('child_process');
+    try {
+      execSync('npm install', { cwd: observerPath, stdio: 'inherit' });
+    } catch {
+      fatal('Failed to install observer dependencies. Run manually: cd packages/squad-observer && npm install');
+    }
+  }
+
+  // Dynamic import for ESM module
+  (async () => {
+    try {
+      const { SquadObserver } = await import(path.join(observerPath, 'src', 'observer.js'));
+      
+      const observer = new SquadObserver({
+        squadDir: squadDirInfo.path,
+        otelEndpoint: endpoint,
+        verbose: verbose,
+        consoleOutput: true,
+      });
+
+      // Graceful shutdown
+      const shutdown = async () => {
+        console.log('\n\nShutting down...');
+        const stats = observer.getStats();
+        console.log(`\nSession stats:`);
+        console.log(`  Files watched: ${stats.filesWatched}`);
+        console.log(`  Events emitted: ${stats.eventsEmitted}`);
+        console.log(`  Agents seen: ${stats.agentsSeen.join(', ') || 'none'}`);
+        await observer.stop();
+        process.exit(0);
+      };
+
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+
+      await observer.start();
+      console.log('Waiting for agent activity... (Ctrl+C to exit)\n');
+
+    } catch (err) {
+      fatal(`Failed to start observer: ${err.message}`);
+    }
+  })();
+
+  // Prevent fall-through
+  return;
+}
 
 // --- Watch subcommand (Ralph local watchdog) ---
 if (cmd === 'watch') {
