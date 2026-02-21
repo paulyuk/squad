@@ -56,7 +56,7 @@ export class MarkdownParser {
    */
   _parseHistoryFile(content) {
     const events = [];
-    const sessionPattern = /## Session (\d{4}-\d{2}-\d{2}[^\n]*)\n([\s\S]*?)(?=## Session|\Z)/g;
+    const sessionPattern = /## Session (\d{4}-\d{2}-\d{2}[^\n]*)\n([\s\S]*?)(?=## Session|$)/g;
     
     let match;
     while ((match = sessionPattern.exec(content)) !== null) {
@@ -86,9 +86,11 @@ export class MarkdownParser {
    * These are individual decision proposals from agents
    */
   _parseDecisionInbox(content, filename) {
-    const agentMatch = filename.match(/^([a-z-]+)-(.+)\.md$/);
-    const agentName = agentMatch ? agentMatch[1] : 'unknown';
-    const topic = agentMatch ? agentMatch[2] : filename.replace('.md', '');
+    // Extract agent name (first word before hyphen) and topic (rest)
+    const withoutExt = filename.replace('.md', '');
+    const firstHyphen = withoutExt.indexOf('-');
+    const agentName = firstHyphen > 0 ? withoutExt.substring(0, firstHyphen) : 'unknown';
+    const topic = firstHyphen > 0 ? withoutExt.substring(firstHyphen + 1) : withoutExt;
 
     return [{
       type: 'decision-proposed',

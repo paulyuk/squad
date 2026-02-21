@@ -100,11 +100,11 @@ export class FileWatcher extends EventEmitter {
       fileType = parts[2] || 'unknown';
     } else if (category === 'decisions') {
       fileType = parts[1] === 'inbox' ? 'decision-inbox' : 'decision';
-      // Try to extract agent name from filename (e.g., "architect-feature-design.md")
+      // Extract agent name (first word before hyphen) from filename
       const filename = path.basename(filePath, '.md');
-      const agentMatch = filename.match(/^([a-z-]+)-/);
-      if (agentMatch) {
-        agentName = agentMatch[1];
+      const firstHyphen = filename.indexOf('-');
+      if (firstHyphen > 0) {
+        agentName = filename.substring(0, firstHyphen);
       }
     } else if (category === 'log') {
       fileType = 'session-log';
