@@ -1,51 +1,61 @@
 /**
- * Telemetry Emitter - Sends OpenTelemetry spans to Aspire Dashboard
+ * Telemetry Emitter - Sends OpenTelemetry spans to Jaeger
  */
 
 import { trace, SpanKind, SpanStatusCode } from '@opentelemetry/api';
-import { NodeSDK } from '@opentelemetry/sdk-node';
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { BasicTracerProvider, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-node';
+import { JaegerExporter } from '@opentelemetry/exporter-jaeger';
 import { Resource } from '@opentelemetry/resources';
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
 
 export class TelemetryEmitter {
   constructor(options = {}) {
     this.options = {
-      serviceName: options.serviceName || 'squad-observer',
+      serviceName: options.serviceName || 'squad-agents',
       serviceVersion: options.serviceVersion || '0.1.0',
-      endpoint: options.endpoint || process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://localhost:18889/v1/traces',
+      endpoint: options.endpoint || process.env.JAEGER_ENDPOINT || 'http://localhost:14268/api/traces',
       ...options
     };
     
-    this.sdk = null;
+    this.provider = null;
     this.tracer = null;
-    this.activeSpans = new Map(); // Track active agent spans
+    this.exporter = null;
+    this.activeSpans = new Map();
   }
 
   /**
-   * Initialize OpenTelemetry SDK
+   * Initialize OpenTelemetry with Jaeger exporter
    */
   async start() {
-    const exporter = new OTLPTraceExporter({
-      url: this.options.endpoint,
+    // Normalize endpoint for Jaeger
+    let endpoint = this.options.endpoint;
+    if (!endpoint.includes('/api/traces')) {
+      // Convert OTLP-style endpoints to Jaeger format
+      endpoint = endpoint.replace(/:\d+.*$/, ':14268/api/traces');
+    }
+    
+    this.exporter = new JaegerExporter({
+      endpoint: endpoint,
     });
 
-    this.sdk = new NodeSDK({
+    this.provider = new BasicTracerProvider({
       resource: new Resource({
         [ATTR_SERVICE_NAME]: this.options.serviceName,
         [ATTR_SERVICE_VERSION]: this.options.serviceVersion,
       }),
-      traceExporter: exporter,
     });
 
-    await this.sdk.start();
+    // Use SimpleSpanProcessor for immediate export
+    this.provider.addSpanProcessor(new SimpleSpanProcessor(this.exporter));
+    this.provider.register();
+    
     this.tracer = trace.getTracer(this.options.serviceName, this.options.serviceVersion);
     
     return this;
   }
 
   /**
-   * Shutdown the SDK gracefully
+   * Shutdown gracefully with flush
    */
   async stop() {
     // End any active spans
@@ -54,14 +64,15 @@ export class TelemetryEmitter {
     }
     this.activeSpans.clear();
 
-    if (this.sdk) {
-      await this.sdk.shutdown();
-      this.sdk = null;
+    if (this.provider) {
+      await this.provider.forceFlush();
+      await this.provider.shutdown();
+      this.provider = null;
     }
   }
 
   /**
-   * Emit a span for an agent event
+   * Emit a span for an agent event - with FULL content visibility
    */
   emitAgentEvent(event) {
     if (!this.tracer) {
@@ -69,24 +80,73 @@ export class TelemetryEmitter {
       return;
     }
 
-    const spanName = this._getSpanName(event);
-    const attributes = this._getAttributes(event);
+    const agentName = event.agentName || 'squad';
+    const content = event.content || '';
+    
+    // Create a descriptive span name with content preview
+    const contentPreview = content
+      .replace(/[#\n\r]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .substring(0, 60);
+    
+    const emoji = this._getEmoji(event.type);
+    const spanName = `${emoji} ${agentName}: ${contentPreview || event.type}`;
 
     const span = this.tracer.startSpan(spanName, {
       kind: SpanKind.INTERNAL,
-      attributes,
+      attributes: {
+        'agent': agentName,
+        'role': this._getAgentRole(agentName),
+        'type': event.type,
+      },
     });
 
-    // Add event content as span event
-    span.addEvent(event.type, {
-      'event.content': event.content?.substring(0, 1000) || '', // Truncate long content
-      'event.timestamp': event.timestamp,
+    // Add the OUTPUT as log events - this is what shows in Jaeger Logs tab
+    // Split content into chunks so it's readable
+    const lines = content.split('\n').filter(l => l.trim());
+    
+    // Add header event
+    span.addEvent('📋 Agent Output', {
+      'agent': agentName,
+      'type': event.type,
+      'file': event.filename || 'unknown',
     });
+    
+    // Add each meaningful line as a separate event (shows as logs)
+    for (let i = 0; i < Math.min(lines.length, 20); i++) {
+      const line = lines[i].trim();
+      if (line && line.length > 2) {
+        span.addEvent(line.substring(0, 200));
+      }
+    }
+    
+    // Add full content as final event
+    if (content.length > 0) {
+      span.addEvent('📝 Full Content', {
+        'output': content.substring(0, 4000),
+      });
+    }
 
     span.setStatus({ code: SpanStatusCode.OK });
     span.end();
 
     return span;
+  }
+
+  /**
+   * Get emoji for event type
+   */
+  _getEmoji(type) {
+    const emojis = {
+      'agent-learning': '🧠',
+      'agent-output': '📝',
+      'decision-proposed': '💡',
+      'decision-merged': '✅',
+      'session-log': '📋',
+      'orchestration-event': '🎯',
+    };
+    return emojis[type] || '📌';
   }
 
   /**
@@ -124,31 +184,47 @@ export class TelemetryEmitter {
   }
 
   /**
-   * Generate span name from event
+   * Generate human-readable span name
    */
   _getSpanName(event) {
-    const agentPart = event.agentName ? `.${event.agentName}` : '';
+    const agent = event.agentName ? event.agentName.charAt(0).toUpperCase() + event.agentName.slice(1) : 'Squad';
     
     switch (event.type) {
       case 'agent-learning':
-        return `agent${agentPart}.learning`;
+        return `🧠 ${agent} learned something`;
       case 'agent-output':
-        return `agent${agentPart}.output`;
+        return `📝 ${agent} output`;
       case 'decision-proposed':
-        return `decision${agentPart}.proposed`;
+        return `💡 ${agent} proposed decision`;
       case 'decision-merged':
-        return `decision.merged`;
+        return `✅ Decision merged`;
       case 'session-log':
-        return `session.log`;
+        return `📋 Session log`;
       case 'orchestration-event':
-        return `orchestration${agentPart}.event`;
+        return `🎯 ${agent} task completed`;
       default:
-        return `squad.${event.type}`;
+        return `${agent}: ${event.type}`;
     }
   }
 
   /**
-   * Extract span attributes from event
+   * Get agent role from name
+   */
+  _getAgentRole(name) {
+    const roles = {
+      'architect': 'Design Lead',
+      'engineer': 'Builder', 
+      'pm': 'Product Manager',
+      'qa': 'Quality Assurance',
+      'docs': 'Documentation',
+      'scribe': 'Team Scribe',
+      'ralph': 'Work Monitor',
+    };
+    return roles[name?.toLowerCase()] || 'Agent';
+  }
+
+  /**
+   * Extract span attributes from event (kept for compatibility)
    */
   _getAttributes(event) {
     const attrs = {
